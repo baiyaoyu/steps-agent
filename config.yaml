@@ -1,0 +1,32 @@
+agent:
+  name: "lightweight-agent"
+  skill_dir: "./skills/user"
+  default_mode: "auto"
+
+models:
+  default: "deepseek-chat"
+  planner_model: "deepseek-chat"
+  quick_reply_model: "qwen-turbo"
+  providers:
+    deepseek:
+      api_key: "${DEEPSEEK_API_KEY}"
+      base_url: "https://api.deepseek.com/v1"
+      model: "deepseek-chat"
+    gemini:
+      api_key: "${GEMINI_API_KEY}"
+      base_url: "https://generativelanguage.googleapis.com/v1beta"
+      model: "gemini-2.0-flash"
+    qwen:
+      api_key: "${QWEN_API_KEY}"
+      base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+      model: "qwen-max"
+
+search:
+  provider: "tavily"
+  api_key: "${TAVILY_API_KEY}"
+
+minio:
+  endpoint: "${MINIO_ENDPOINT}"
+  access_key: "${MINIO_ACCESS_KEY}"
+  secret_key: "${MINIO_SECRET_KEY}"
+  bucket: "${MINIO_BUCKET}"
