@@ -1,0 +1,115 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Steps Agent</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <div>
+          <p class="eyebrow">Steps Agent</p>
+          <h1>Agent 控制台</h1>
+          <p class="subtitle">规划、工具调用、事件流和历史会话都在这里观察。</p>
+        </div>
+        <div class="status-card">
+          <span id="statusDot" class="dot"></span>
+          <div>
+            <strong id="statusText">待命</strong>
+            <small id="statusHint">等待任务</small>
+          </div>
+        </div>
+      </section>
+
+      <section class="grid">
+        <aside class="panel side">
+          <div class="panel-head">
+            <h2>运行配置</h2>
+            <button id="refreshMeta" class="ghost" type="button">刷新</button>
+          </div>
+
+          <label>模型 <select id="modelSelect"><option value="">默认模型</option></select></label>
+          <label>
+            模式
+            <select id="modeSelect">
+              <option value="auto">自动</option>
+              <option value="quick_reply">快速回复</option>
+              <option value="planning">规划执行</option>
+            </select>
+          </label>
+
+          <div class="inline-field">
+            <label class="check"><input id="autoRepair" type="checkbox" checked /> 自动修复工具参数</label>
+            <label>重试 <input id="repairAttempts" type="number" min="0" max="3" value="1" /></label>
+          </div>
+
+          <div class="divider"></div>
+          <section class="session-entry">
+            <h3>新建会话</h3>
+            <textarea id="newSessionInput" placeholder="输入新任务，后台并行发起"></textarea>
+            <button id="newSessionButton" type="button">发起会话</button>
+          </section>
+
+          <div class="divider"></div>
+          <div class="panel-head">
+            <h3>历史会话</h3>
+            <button id="refreshHistory" class="ghost" type="button">刷新</button>
+          </div>
+          <div id="historyList" class="history-list"><p class="muted">暂无历史</p></div>
+
+          <div class="divider"></div>
+          <h3>可用能力</h3>
+          <div id="skillsList" class="skills-list"><p class="muted">正在加载...</p></div>
+        </aside>
+
+        <section class="panel workspace">
+          <form id="runForm" class="composer">
+            <label for="promptInput">任务输入</label>
+            <textarea id="promptInput" placeholder="例如：帮我获取当日科技新闻的时间线" required></textarea>
+            <small id="formModeHint" class="mode-hint">编辑新任务</small>
+            <div class="actions">
+              <button id="runButton" type="submit">开始运行</button>
+              <button id="planButton" class="secondary" type="button">仅规划</button>
+              <button id="executePlanButton" class="secondary hidden" type="button">执行规划</button>
+              <button id="reconnectButton" class="secondary hidden" type="button">重新连接</button>
+              <button id="duplicateButton" class="secondary hidden" type="button">用此问题新建</button>
+            </div>
+          </form>
+
+          <div class="tabs">
+            <button class="tab active" data-tab="stream" type="button">流式输出</button>
+            <button class="tab" data-tab="graph" type="button">图形视图</button>
+            <button class="tab" data-tab="plan" type="button">Plan</button>
+            <button class="tab" data-tab="events" type="button">事件</button>
+            <button class="tab" data-tab="final" type="button">最终结果</button>
+          </div>
+
+          <section id="streamTab" class="tab-panel active">
+            <div id="streamOutput" class="stream empty">运行后，模型输出会显示在这里。</div>
+          </section>
+
+          <section id="graphTab" class="tab-panel">
+            <div class="graph-wrap">
+              <div>
+                <h3>Plan 图</h3>
+                <div id="planGraph" class="graph empty">暂无 Plan</div>
+              </div>
+              <div>
+                <h3>事件时间线</h3>
+                <div id="eventGraph" class="timeline empty">暂无事件</div>
+              </div>
+            </div>
+          </section>
+
+          <section id="planTab" class="tab-panel"><textarea id="planOutput" class="code plan-editor empty" spellcheck="false">暂无 Plan</textarea></section>
+          <section id="eventsTab" class="tab-panel"><div id="eventsOutput" class="events empty">暂无事件</div></section>
+          <section id="finalTab" class="tab-panel"><pre id="finalOutput" class="code empty">暂无最终结果</pre></section>
+        </section>
+      </section>
+    </main>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
