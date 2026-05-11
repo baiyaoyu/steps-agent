@@ -1,12 +1,16 @@
 """HTTP 接口层：FastAPI + SSE 流式输出。"""
 
+import asyncio
 import json
+import re
+from pathlib import Path
 from typing import AsyncIterator
 
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, status
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel, Field
 
@@ -17,6 +21,11 @@ from agent.planner import Planner
 from agent.registry import Registry
 from agent.router import Router
 from agent.tools import execute_tool
+from agent.logging_config import LOG_FILE, get_logger
+from agent.run_store import run_store
+
+
+logger = get_logger(__name__)
 
 
 @asynccontextmanager
@@ -37,21 +46,63 @@ class ExecuteRequest(BaseModel):
     plan: list = Field(..., description="Plan JSON 数组")
     context: dict = Field(default_factory=dict, description="初始上下文变量")
     model: str | None = Field(None, description="指定模型名称，留空使用默认模型")
+    auto_repair: bool = Field(True, description="工具步骤失败后是否自动尝试修复参数并重试")
+    max_repair_attempts: int = Field(1, ge=0, le=3, description="每个失败工具步骤最多自动修复重试次数")
+
+
+class ExecuteRunRequest(ExecuteRequest):
+    input: str = Field("", description="生成该 Plan 的原始用户输入，用于历史会话展示")
 
 
 class RunRequest(BaseModel):
     input: str = Field(..., description="用户输入的自然语言请求")
     mode: str = Field("auto", description="模式: auto | quick_reply | planning")
     model: str | None = Field(None, description="指定模型名称，留空使用默认模型")
+    auto_repair: bool = Field(True, description="工具步骤失败后是否自动尝试修复参数并重试")
+    max_repair_attempts: int = Field(1, ge=0, le=3, description="每个失败工具步骤最多自动修复重试次数")
 
 
 app = FastAPI(title="轻量级动态智能体", lifespan=lifespan)
+FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
+
+if FRONTEND_DIR.exists():
+    app.mount("/static", StaticFiles(directory=FRONTEND_DIR), name="static")
+
+
+SSE_RESPONSES = {
+    200: {
+        "description": "Server-Sent Events stream. Swagger UI cannot render this stream well; use /api/run-json for docs debugging.",
+        "content": {
+            "text/event-stream": {
+                "schema": {
+                    "type": "string",
+                    "example": 'data: {"type":"thinking","content":"..."}\n\ndata: {"type":"done","final_result":"..."}\n\n',
+                }
+            }
+        },
+    }
+}
+
+
+SENSITIVE_LOG_PATTERNS = (
+    re.compile(r"(?i)(api[_-]?key['\"]?\s*[:=]\s*['\"]?)([^'\"\s,}]+)"),
+    re.compile(r"(?i)(authorization['\"]?\s*[:=]\s*['\"]?bearer\s+)([^'\"\s,}]+)"),
+    re.compile(r"(?i)(token['\"]?\s*[:=]\s*['\"]?)([^'\"\s,}]+)"),
+    re.compile(r"(?i)(password['\"]?\s*[:=]\s*['\"]?)([^'\"\s,}]+)"),
+)
+
+
+def _redact_log_line(line: str) -> str:
+    for pattern in SENSITIVE_LOG_PATTERNS:
+        line = pattern.sub(r"\1****", line)
+    return line
 
 
 # ========== 全局异常处理 ==========
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request, exc):
+    logger.warning("request_validation_failed path=%s errors=%s", request.url.path, exc.errors())
     """请求参数校验失败。"""
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -61,6 +112,7 @@ async def validation_exception_handler(request, exc):
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request, exc):
+    logger.exception("request_failed path=%s", request.url.path)
     """兜底异常处理。"""
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -109,6 +161,100 @@ async def _sse_format(events: AsyncIterator[dict]) -> AsyncIterator[str]:
         yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
 
 
+async def _run_background(run_id: str, req: RunRequest):
+    run_store.mark_running(run_id)
+    logger.info("run_background_start id=%s", run_id)
+    try:
+        async for event in _run_full(req.input, req.mode, req.model, req.auto_repair, req.max_repair_attempts):
+            await run_store.append_event(run_id, event)
+    except Exception as e:
+        logger.exception("run_background_failed id=%s", run_id)
+        await run_store.append_event(run_id, {"type": "error", "message": str(e)})
+
+
+async def _execute_background(run_id: str, req: ExecuteRunRequest):
+    run_store.mark_running(run_id)
+    logger.info("execute_background_start id=%s", run_id)
+    try:
+        await run_store.append_event(run_id, {"type": "thinking", "content": "执行已有 Plan"})
+        await run_store.append_event(run_id, {"type": "plan_generated", "plan": req.plan})
+        try:
+            model_inst = _get_model(req.model) if req.model else None
+        except Exception as e:
+            await run_store.append_event(run_id, {"type": "error", "message": f"模型初始化失败: {str(e)}"})
+            await run_store.append_event(run_id, {"type": "done", "final_result": ""})
+            return
+
+        ctx = ExecutionContext()
+        ctx.variables.update(req.context)
+        async for event in _execute_plan(
+            req.plan,
+            ctx,
+            model_instance=model_inst,
+            auto_repair=req.auto_repair,
+            max_repair_attempts=req.max_repair_attempts,
+        ):
+            await run_store.append_event(run_id, event)
+    except Exception as e:
+        logger.exception("execute_background_failed id=%s", run_id)
+        await run_store.append_event(run_id, {"type": "error", "message": str(e)})
+
+
+async def _stored_run_events(run_id: str, from_index: int = 0) -> AsyncIterator[dict]:
+    index = max(0, from_index)
+    while True:
+        record, events = await run_store.wait_for_events(run_id, index)
+        if record is None:
+            yield {"type": "error", "message": "run not found"}
+            return
+        for event in events:
+            index = int(event.get("index", index)) + 1
+            yield event
+        if record.get("status") in {"done", "error"} and index >= len(record.get("events", [])):
+            return
+
+
+async def _collect_events(events: AsyncIterator[dict]) -> dict:
+    """Collect an SSE event iterator into a JSON payload for Swagger/debug clients."""
+    collected = []
+    final_result = ""
+    async for event in events:
+        collected.append(event)
+        if event.get("type") == "done":
+            final_result = event.get("final_result", "")
+    return {"success": True, "events": collected, "final_result": final_result}
+
+
+def _final_text_from_output(output) -> str:
+    """Extract a useful final text value from a step output."""
+    if output is None:
+        return ""
+    if isinstance(output, str):
+        return output
+    if not isinstance(output, dict):
+        return str(output)
+
+    for key in ("content", "stdout", "value", "path", "message"):
+        value = output.get(key)
+        if value:
+            return str(value)
+
+    return json.dumps(output, ensure_ascii=False) if output else ""
+
+
+def _build_final_result(plan: list[dict], ctx: ExecutionContext) -> str:
+    """Use the last meaningful step output, then fall back to stored state."""
+    for step in reversed(plan):
+        step_id = str(step.get("step_id", ""))
+        text = _final_text_from_output(ctx.outputs.get(step_id))
+        if text:
+            return text
+
+    if ctx.variables:
+        return json.dumps(ctx.variables, ensure_ascii=False)
+    return ""
+
+
 async def _fix_step(model, tool_id: str, original_params: dict, error_message: str) -> dict | None:
     """调用模型修复执行失败的步骤参数。"""
     from agent.tools import get_tool_meta
@@ -149,7 +295,13 @@ async def _fix_step(model, tool_id: str, original_params: dict, error_message: s
     return None
 
 
-async def _execute_plan(plan: list[dict], context: ExecutionContext | None = None, model_instance=None) -> AsyncIterator[dict]:
+async def _execute_plan(
+    plan: list[dict],
+    context: ExecutionContext | None = None,
+    model_instance=None,
+    auto_repair: bool = True,
+    max_repair_attempts: int = 1,
+) -> AsyncIterator[dict]:
     """执行 Plan 并产生 SSE 事件。"""
     ctx = context or ExecutionContext()
     ExecutionContext.set_current(ctx)
@@ -174,24 +326,65 @@ async def _execute_plan(plan: list[dict], context: ExecutionContext | None = Non
                 yield {"type": "tool_invoke", "step_id": step_id, "tool_id": tool_id, "params": resolved_params}
                 result = execute_tool(tool_id, **resolved_params)
 
-                # 自动修复：失败后调用模型修复参数，重试一次
-                if not result.get("success", False):
+                # 自动修复：失败后调用模型修复参数并重试
+                if auto_repair and max_repair_attempts > 0 and not result.get("success", False):
                     error_msg = result.get("error", "未知错误")
-                    yield {"type": "thinking", "content": f"步骤 {step_id} ({tool_id}) 执行失败: {error_msg}，尝试自动修复..."}
+                    current_params = resolved_params
 
-                    try:
-                        fixed_params = await _fix_step(model, tool_id, resolved_params, error_msg)
-                        if fixed_params:
-                            yield {"type": "thinking", "content": f"获取到修复参数: {json.dumps(fixed_params, ensure_ascii=False)}，重试中..."}
+                    for attempt in range(1, max_repair_attempts + 1):
+                        yield {
+                            "type": "repair_attempt",
+                            "step_id": step_id,
+                            "tool_id": tool_id,
+                            "attempt": attempt,
+                            "max_attempts": max_repair_attempts,
+                            "error": error_msg,
+                            "params": current_params,
+                        }
+
+                        try:
+                            fixed_params = await _fix_step(model, tool_id, current_params, error_msg)
+                            if not fixed_params:
+                                yield {
+                                    "type": "repair_failed",
+                                    "step_id": step_id,
+                                    "tool_id": tool_id,
+                                    "attempt": attempt,
+                                    "error": "无法生成修复参数",
+                                }
+                                break
+
                             result = execute_tool(tool_id, **fixed_params)
                             if result.get("success", False):
-                                yield {"type": "thinking", "content": f"步骤 {step_id} 自动修复成功"}
-                            else:
-                                yield {"type": "thinking", "content": f"步骤 {step_id} 修复后仍失败: {result.get('error', '未知错误')}"}
-                        else:
-                            yield {"type": "thinking", "content": f"步骤 {step_id} 无法生成修复方案，保持原始错误"}
-                    except Exception as fix_err:
-                        yield {"type": "thinking", "content": f"步骤 {step_id} 自动修复过程出错: {str(fix_err)}"}
+                                yield {
+                                    "type": "step_repaired",
+                                    "step_id": step_id,
+                                    "tool_id": tool_id,
+                                    "attempt": attempt,
+                                    "params": fixed_params,
+                                    "result": result,
+                                }
+                                break
+
+                            current_params = fixed_params
+                            error_msg = result.get("error", "未知错误")
+                            yield {
+                                "type": "repair_failed",
+                                "step_id": step_id,
+                                "tool_id": tool_id,
+                                "attempt": attempt,
+                                "params": fixed_params,
+                                "error": error_msg,
+                            }
+                        except Exception as fix_err:
+                            yield {
+                                "type": "repair_failed",
+                                "step_id": step_id,
+                                "tool_id": tool_id,
+                                "attempt": attempt,
+                                "error": str(fix_err),
+                            }
+                            break
 
                 ctx.set_output(step_id, result)
                 yield {"type": "tool_result", "step_id": step_id, "tool_id": tool_id, "result": result}
@@ -222,6 +415,7 @@ async def _execute_plan(plan: list[dict], context: ExecutionContext | None = Non
                 raw_value = step.get("value", "")
                 resolved_value = ctx.resolve(raw_value)
                 ctx.set_variable(key, resolved_value)
+                ctx.set_output(step_id, {"key": key, "value": resolved_value, "content": resolved_value})
                 yield {"type": "state_stored", "step_id": step_id, "key": key, "value": resolved_value}
 
             else:
@@ -230,21 +424,16 @@ async def _execute_plan(plan: list[dict], context: ExecutionContext | None = Non
         except Exception as e:
             yield {"type": "error", "step_id": step_id, "message": f"Step 执行失败: {str(e)}"}
 
-    # 构建最终回复：取最后一步的输出
-    final_result = ""
-    if plan:
-        last_step = plan[-1]
-        last_id = str(last_step.get("step_id", ""))
-        last_output = ctx.outputs.get(last_id, {})
-        if isinstance(last_output, dict):
-            final_result = last_output.get("content", last_output.get("stdout", json.dumps(last_output, ensure_ascii=False)))
-        else:
-            final_result = str(last_output)
-
-    yield {"type": "done", "final_result": final_result}
+    yield {"type": "done", "final_result": _build_final_result(plan, ctx)}
 
 
-async def _run_full(user_input: str, mode: str = "auto", model_name: str | None = None) -> AsyncIterator[dict]:
+async def _run_full(
+    user_input: str,
+    mode: str = "auto",
+    model_name: str | None = None,
+    auto_repair: bool = True,
+    max_repair_attempts: int = 1,
+) -> AsyncIterator[dict]:
     """完整流程：Router -> Planner -> Executor。"""
     try:
         model_inst = _get_model(model_name) if model_name else _get_model()
@@ -307,7 +496,12 @@ async def _run_full(user_input: str, mode: str = "auto", model_name: str | None 
 
     yield {"type": "plan_generated", "plan": plan}
 
-    async for event in _execute_plan(plan, model_instance=model_inst):
+    async for event in _execute_plan(
+        plan,
+        model_instance=model_inst,
+        auto_repair=auto_repair,
+        max_repair_attempts=max_repair_attempts,
+    ):
         yield event
 
 
@@ -326,7 +520,7 @@ async def plan_endpoint(req: PlanRequest):
         )
 
 
-@app.post("/api/execute", summary="仅执行", description="传入已有的 Plan JSON，由 Executor 顺序执行并 SSE 流式返回执行过程。")
+@app.post("/api/execute", summary="仅执行", description="传入已有的 Plan JSON，由 Executor 顺序执行并 SSE 流式返回执行过程。", responses=SSE_RESPONSES)
 async def execute_endpoint(req: ExecuteRequest):
     """仅执行，SSE 流式输出。"""
     ctx = ExecutionContext()
@@ -341,17 +535,47 @@ async def execute_endpoint(req: ExecuteRequest):
         )
 
     return StreamingResponse(
-        _sse_format(_execute_plan(req.plan, ctx, model_instance=model_inst)),
+        _sse_format(
+            _execute_plan(
+                req.plan,
+                ctx,
+                model_instance=model_inst,
+                auto_repair=req.auto_repair,
+                max_repair_attempts=req.max_repair_attempts,
+            )
+        ),
         media_type="text/event-stream",
     )
 
 
-@app.post("/api/run", summary="运行", description="完整流程：Router 分类 → Planner 规划 → Executor 执行，全过程 SSE 流式输出。")
+@app.get("/", include_in_schema=False)
+async def index_page():
+    """Serve the lightweight frontend."""
+    index_path = FRONTEND_DIR / "index.html"
+    if not index_path.exists():
+        return JSONResponse(
+            status_code=status.HTTP_404_NOT_FOUND,
+            content={"success": False, "error": "前端页面不存在"},
+        )
+    return FileResponse(index_path)
+
+
+@app.post("/api/run", summary="运行", description="完整流程：Router 分类 → Planner 规划 → Executor 执行，全过程 SSE 流式输出。", responses=SSE_RESPONSES)
 async def run_endpoint(req: RunRequest):
     """封装接口：plan + execute，SSE 流式输出。"""
     return StreamingResponse(
-        _sse_format(_run_full(req.input, req.mode, req.model)),
+        _sse_format(_run_full(req.input, req.mode, req.model, req.auto_repair, req.max_repair_attempts)),
         media_type="text/event-stream",
+    )
+
+
+@app.post("/api/run-json", summary="运行（JSON 调试版）", description="与 /api/run 相同的流程，但将 SSE 事件收集为普通 JSON，方便 Swagger UI 调试。")
+async def run_json_endpoint(req: RunRequest):
+    """Swagger/debug friendly version of /api/run."""
+    return JSONResponse(
+        content=await _collect_events(
+            _run_full(req.input, req.mode, req.model, req.auto_repair, req.max_repair_attempts)
+        )
     )
 
 
@@ -410,3 +634,53 @@ async def list_models_endpoint():
         })
 
     return JSONResponse(content={"models": result, "default": default_model})
+
+
+@app.post("/api/runs", summary="创建后台运行")
+async def create_run_endpoint(req: RunRequest):
+    record = run_store.create(req.model_dump())
+    task = asyncio.create_task(_run_background(record["id"], req))
+    run_store.set_task(record["id"], task)
+    return JSONResponse(content={"success": True, "run_id": record["id"], "run": record})
+
+
+@app.post("/api/runs/execute", summary="后台执行已有 Plan")
+async def create_execute_run_endpoint(req: ExecuteRunRequest):
+    request = req.model_dump()
+    request["mode"] = "execute"
+    if not request.get("input"):
+        request["input"] = "执行已有 Plan"
+    record = run_store.create(request)
+    task = asyncio.create_task(_execute_background(record["id"], req))
+    run_store.set_task(record["id"], task)
+    return JSONResponse(content={"success": True, "run_id": record["id"], "run": record})
+
+
+@app.get("/api/runs", summary="历史会话")
+async def list_runs_endpoint():
+    return JSONResponse(content={"success": True, "runs": run_store.list()})
+
+
+@app.get("/api/runs/{run_id}", summary="运行详情")
+async def get_run_endpoint(run_id: str):
+    record = run_store.get(run_id)
+    if record is None:
+        return JSONResponse(status_code=status.HTTP_404_NOT_FOUND, content={"success": False, "error": "run not found"})
+    return JSONResponse(content={"success": True, "run": record})
+
+
+@app.get("/api/runs/{run_id}/events", summary="订阅运行事件", responses=SSE_RESPONSES)
+async def run_events_endpoint(run_id: str, from_index: int = 0):
+    return StreamingResponse(
+        _sse_format(_stored_run_events(run_id, from_index)),
+        media_type="text/event-stream",
+    )
+
+
+@app.get("/api/logs", summary="查看最近日志")
+async def logs_endpoint(lines: int = 200):
+    if not LOG_FILE.exists():
+        return JSONResponse(content={"success": True, "logs": []})
+    content = LOG_FILE.read_text(encoding="utf-8", errors="replace").splitlines()
+    tail = content[-max(1, min(lines, 1000)):]
+    return JSONResponse(content={"success": True, "logs": [_redact_log_line(line) for line in tail]})

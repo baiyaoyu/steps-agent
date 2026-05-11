@@ -4,6 +4,85 @@
 
 ---
 
+## 快速运行与调试
+
+启动服务：
+
+```bash
+python main.py
+```
+
+打开接口文档：
+
+```text
+http://127.0.0.1:8000/docs
+```
+
+打开前端控制台：
+
+```text
+http://127.0.0.1:8000/
+```
+
+当前产品由三类能力组成：
+
+- **新建会话**：在前端侧栏独立发起后台 run，多个 run 可以并行执行；新建后当前工作区会立即切到新 run。
+- **当前会话**：一次只观察一个 active run，展示输入、Plan、事件流、图形视图和最终结果；历史会话只读，可重新连接原 run。
+- **Plan 审阅执行**：`仅规划` 生成可编辑 Plan 草稿，用户确认或修改 JSON 后点击 `执行规划`，通过后台 run 执行已有 Plan，不会重新触发 Planner。
+
+`/api/run` 是生产用的 SSE 流式接口，返回 `Content-Type: text/event-stream`。Swagger UI 对流式响应展示不完整，调试时建议优先使用 `/api/run-json`，它会执行同样流程，但把事件收集成普通 JSON 返回。
+
+SSE 流式测试：
+
+```bash
+curl -N -X POST "http://127.0.0.1:8000/api/run" \
+  -H "Content-Type: application/json" \
+  -d "{\"input\":\"来 一个前端输出的plan\",\"mode\":\"auto\",\"model\":\"qwen-max\"}"
+```
+
+Swagger/JSON 调试：
+
+```bash
+curl -X POST "http://127.0.0.1:8000/api/run-json" \
+  -H "Content-Type: application/json" \
+  -d "{\"input\":\"来 一个前端输出的plan\",\"mode\":\"auto\",\"model\":\"qwen-max\"}"
+```
+
+典型事件顺序：
+
+1. `thinking`：路由和规划过程。
+2. `plan_generated`：Planner 生成的 Plan JSON。
+3. `tool_invoke` / `tool_result`：工具调用和结果。
+4. `llm`：模型流式文本分片。
+5. `state_stored`：显式保存的中间状态。
+6. `done`：最终结果，`final_result` 会优先取最后一个有意义的步骤输出；如果最后一步是 `store_state`，会返回保存的值。
+
+规划约束：
+
+- 用户只是要求“输出 plan / 计划 / 方案”时，Planner 应优先生成计划内容，不会默认搜索或写文件。
+- 只有明确要求“搜索、查询、最新、当前信息”时才调用 `tavily_search`。
+- 只有明确要求“保存、写入、生成文件、落盘”时才调用 `write_file`。
+- 如果 LLM 输出要写入文件，Planner 会要求只输出目标文件内容，避免 Markdown 代码块和解释文字混入文件。
+
+推荐的 Plan 审阅执行流程：
+
+1. 调用 `/api/plan` 生成初始 Plan。
+2. 前端展示可编辑 Plan JSON，允许用户删除、插入、调整步骤和参数。
+3. 将确认后的 Plan 传给 `/api/runs/execute` 创建后台执行 run，进入历史会话并支持断线重连。
+4. `/api/execute` 仍保留为临时 SSE 执行接口，适合调试；它不写入历史会话。
+5. 执行接口默认开启 `auto_repair`，工具步骤失败时会局部修复参数并重试，不会重新生成整份 Plan。
+6. 前端监听 `repair_attempt`、`step_repaired`、`repair_failed` 事件，展示自动修复过程。
+
+执行确认后的 Plan：
+
+```bash
+curl -N -X POST "http://127.0.0.1:8000/api/execute" \
+  -H "Content-Type: application/json" \
+  -d "{\"plan\":[{\"step_id\":1,\"type\":\"llm\",\"prompt\":\"输出一个前端消费 /api/run SSE 的计划\"}],\"auto_repair\":true,\"max_repair_attempts\":1}"
+```
+
+---
+
 ## 1. 设计目标
 
 构建一个 **Token 高效、架构轻量、内置工具 + 用户 Skill 扩展** 的动态智能体后端系统。对简单请求直接流式回复，对复杂请求动态规划并流式执行。
@@ -51,8 +130,12 @@ project-root/
 │           ├── SKILL.md
 │           ├── exec.py     # 主入口脚本
 │           └── helper.py   # 辅助脚本（skill 内部使用，Planner 不感知）
-├── web/                    # 前端项目目录（后续迭代）
-│   └── ...
+├── frontend/               # 内置控制台：新建会话、历史会话、Plan 编辑、SSE 事件观察
+│   ├── index.html
+│   ├── app.js
+│   └── styles.css
+├── data/runs/              # 后台 run 历史记录（运行时生成）
+├── logs/                   # 服务日志（运行时生成）
 ├── config.yaml
 └── README.md
 ```
@@ -317,6 +400,9 @@ oss:
 | `plan_generated` | Planner 完成规划 | `plan` (JSON 数组) |
 | `tool_invoke` | 开始调用内置工具 | `step_id`, `tool_id`, `params` |
 | `tool_result` | 内置工具执行完成 | `step_id`, `tool_id`, `result` |
+| `repair_attempt` | 工具失败后开始局部修复 | `step_id`, `tool_id`, `attempt`, `error`, `params` |
+| `step_repaired` | 局部修复成功 | `step_id`, `tool_id`, `attempt`, `params`, `result` |
+| `repair_failed` | 局部修复失败 | `step_id`, `tool_id`, `attempt`, `error` |
 | `llm` | LLM 生成的文本片段（流式） | `step_id`, `content` |
 | `user_input_request` | 需要用户输入 | `step_id`, `question`, `options` |
 | `error` | 执行错误 | `step_id`, `message`, `strategy` |
@@ -349,7 +435,7 @@ data: {"type": "done", "final_result": "根据搜索结果，轻量级 Agent 框
 
 ## 12. API 接口设计
 
-提供 **三个独立接口**：规划、执行、以及封装好的统一运行接口。
+提供三类接口：临时调试接口、封装运行接口、后台 run 持久化接口。
 
 ### 12.1 `POST /api/plan` —— 仅规划
 
@@ -383,11 +469,25 @@ data: {"type": "done", "final_result": "根据搜索结果，轻量级 Agent 框
 ```json
 {
   "plan": [...],
-  "context": {}  // 可选：注入初始上下文
+  "context": {},
+  "auto_repair": true,
+  "max_repair_attempts": 1
 }
 ```
 
 **响应**：`Content-Type: text/event-stream`，SSE 流（见第 11 节）。
+
+`auto_repair` 开启时，工具步骤失败后会尝试局部修复参数并重试。修复过程会产生额外事件：
+
+```text
+data: {"type": "repair_attempt", "step_id": 1, "tool_id": "read_file", "attempt": 1, ...}
+data: {"type": "step_repaired", "step_id": 1, "tool_id": "read_file", "attempt": 1, ...}
+data: {"type": "repair_failed", "step_id": 1, "tool_id": "read_file", "attempt": 1, ...}
+```
+
+这使得推荐链路变为：先用 `/api/plan` 生成并人工确认 Plan，再用 `/api/execute` 执行确认后的 Plan，并让执行器处理单步失败的局部修复。
+
+如果需要进入前端历史会话和断线重连，请使用 `/api/runs/execute`，而不是 `/api/execute`。
 
 ### 12.3 `POST /api/run` —— 封装接口（plan + execute）
 
@@ -417,6 +517,37 @@ data: {"type": "thinking", "content": "进入 Quick Reply 模式"}
 data: {"type": "llm", "content": "你好"}
 data: {"type": "done", "final_result": "你好！有什么可以帮你的吗？"}
 ```
+
+### 12.4 后台 run 与历史会话接口
+
+`POST /api/runs` 创建一个后台 run，执行完整 `Router -> Planner -> Executor` 流程。该接口立即返回 `run_id`，后续通过 SSE 订阅事件。
+
+```json
+{
+  "input": "帮我获取当日科技新闻的时间线",
+  "mode": "auto",
+  "auto_repair": true,
+  "max_repair_attempts": 1
+}
+```
+
+`POST /api/runs/execute` 创建一个后台 run 来执行已有 Plan，不会重新触发 Planner。
+
+```json
+{
+  "input": "生成该 Plan 的原始问题",
+  "plan": [{"step_id": 1, "type": "llm", "prompt": "输出摘要"}],
+  "context": {},
+  "auto_repair": true,
+  "max_repair_attempts": 1
+}
+```
+
+`GET /api/runs` 返回历史会话摘要。摘要中的 `event_count` 是面向用户的折叠事件数，流式 LLM 分片按 step 合并；`raw_event_count` 保留原始事件数，供调试使用。摘要还包含 step 进度和修复次数。
+
+`GET /api/runs/{run_id}` 返回完整 run 记录。
+
+`GET /api/runs/{run_id}/events?from_index=N` 从指定事件 index 继续订阅 SSE，前端历史会话重连使用该接口。
 
 ---
 

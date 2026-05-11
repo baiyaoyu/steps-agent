@@ -48,6 +48,9 @@ class Registry:
                     "description": meta.get("description", ""),
                     "type": "skill",  # 约定
                     "dependencies": meta.get("dependencies", []),
+                    "execution_script": meta.get("execution_script", ""),
+                    "interpreter": meta.get("interpreter", ""),
+                    "params_schema": meta.get("params_schema", {}),
                     "dir": str(subdir),
                 }
             except Exception:
@@ -63,6 +66,9 @@ class Registry:
 
     def lazy_load(self, skill_id: str) -> dict | None:
         """按需加载指定 Skill 的完整内容。"""
+        if not self._meta_cache:
+            self.scan()
+
         if skill_id in self._detail_cache:
             return self._detail_cache[skill_id]
 

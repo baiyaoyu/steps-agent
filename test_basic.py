@@ -103,7 +103,7 @@ def test_registry():
     print("Registry 测试通过")
 
 
-async def test_api_plan():
+def test_api_plan():
     print("\n=== 测试 /api/plan 接口 ===")
     from agent.planner import Planner
     planner = Planner()

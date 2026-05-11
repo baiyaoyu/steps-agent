@@ -12,6 +12,7 @@ import re
 import json
 import requests
 from bs4 import BeautifulSoup
+from urllib.parse import urljoin
 
 
 # 热点关键词（用于识别重要新闻）
