@@ -14,6 +14,8 @@
 - 支持多模型（DeepSeek、Gemini、Qwen）
 - SSE 流式输出，事件类型区分 thinking / tool_invoke / tool_result / llm / done
 - Planner 规划与 Executor 执行拆分为独立接口
+- 后台 run 持久化：支持历史会话、断线重连、并行发起任务
+- 内置前端控制台：支持新建会话、Plan 编辑、执行已有 Plan、历史只读查看
 
 ---
 
@@ -22,7 +24,7 @@
 ```
 agent/
 ├── __init__.py
-├── api.py              # FastAPI HTTP 接口（/api/plan、/api/execute、/api/run）
+├── api.py              # FastAPI HTTP 接口（/api/plan、/api/execute、/api/run、/api/runs）
 ├── config.py           # 配置读取（config.yaml），支持 ${ENV_VAR} 环境变量注入
 ├── executor.py         # ExecutionContext（contextvars 封装）+ Plan 执行引擎
 ├── planner.py          # LLM 规划器，生成 Plan JSON
@@ -95,7 +97,7 @@ python main.py
 
 ### 4.2 `POST /api/execute` —— 仅执行
 
-**用途**：传入已有的 Plan JSON，由 Executor 顺序执行并 SSE 流式输出。
+**用途**：传入已有的 Plan JSON，由 Executor 顺序执行并 SSE 流式输出。该接口不写入历史会话，适合临时调试。
 
 **请求体**：
 ```json
@@ -136,6 +138,22 @@ data: {"type": "thinking", "content": "进入 Quick Reply 模式"}
 data: {"type": "llm", "content": "你好！有什么可以帮你的吗？"}
 data: {"type": "done", "final_result": "你好！有什么可以帮你的吗？"}
 ```
+
+---
+
+### 4.4 后台 run 接口
+
+前端控制台优先使用后台 run 接口，因为它支持历史会话和断线重连。
+
+| 接口 | 用途 |
+|------|------|
+| `POST /api/runs` | 创建后台 run，执行完整 Router -> Planner -> Executor 流程 |
+| `POST /api/runs/execute` | 创建后台 run，执行已有 Plan，不重新规划 |
+| `GET /api/runs` | 获取历史会话摘要 |
+| `GET /api/runs/{run_id}` | 获取完整 run 记录 |
+| `GET /api/runs/{run_id}/events?from_index=N` | 从指定事件 index 继续订阅 SSE |
+
+历史摘要中的 `event_count` 是用户可读的折叠事件数，LLM 流式分片按 step 合并；`raw_event_count` 是原始事件数，用于调试。摘要还包含 step 进度和自动修复次数。
 
 ---
 
