@@ -1,12 +1,40 @@
 ---
 name: news-aggregator
-description: 聚合联合早报、澎湃新闻、财新网、36氪生成24h/48h/72h新闻时间线，智能挑选热点新闻生成封面，支持获取36氪"8点1氪"专栏并解析内容结构；当用户需要查看新闻时间线、追踪近期热点、获取今日8点1氪、快速了解时事动态时使用
-dependency:
+description: 聚合联合早报、澎湃新闻、财新网、36氪生成24h/48h/72h新闻时间线，智能挑选热点新闻生成封面，支持获取36氪"8点1氪"专栏并解析内容结构；当用户需要查看新闻时间线、当日科技新闻时间线、追踪近期热点、获取今日8点1氪、快速了解时事动态时使用
+dependencies:
   python:
     - requests==2.31.0
     - beautifulsoup4==4.12.2
     - lxml==4.9.3
     - python-dotenv>=1.0.0
+execution_script: scripts/news_fetcher.py
+interpreter: python
+params_schema:
+  hours:
+    type: integer
+    required: false
+    default: 24
+    description: 时间范围，可选 4、8、12、24、48、72 小时
+  source:
+    type: string
+    required: false
+    default: all
+    description: 新闻来源，all / zaobao / pengpai / caixin / kr36，可逗号分隔；科技新闻、创业创投、科技公司动态优先使用 kr36
+  limit:
+    type: integer
+    required: false
+    default: 20
+    description: 最大新闻条数，0 表示不限制
+  cover:
+    type: string
+    required: false
+    default: crawl
+    description: 封面模式，crawl 或 ai
+  8d1k:
+    type: boolean
+    required: false
+    default: false
+    description: 只获取 36氪「8点1氪」专栏内容
 ---
 
 # 新闻聚合器
